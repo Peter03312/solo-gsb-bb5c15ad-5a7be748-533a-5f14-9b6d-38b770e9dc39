@@ -16,6 +16,11 @@
   可成功；各发布版不可变，可读取分配结果及与前版差异；**已发布版不会因
   占用变化自动重写**；
 - 占用登记/撤销与发布按场次串行，发布始终基于一份一致的当前占用状态；
+- **现场占用调整（预演+确认）**：现场在调整外部频点占用前，可按场次以待
+  撤销占用编号、待登记频点与左闭右开整数分钟时段一次**预演**，取得覆盖当前
+  发布版、设备组/干扰配置与占用的**快照标识**、当前版在变更后违反约束的组与
+  **替代分配**；携带快照标识与同一变更**确认**时，状态有变化即冲突，否则
+  原子完成占用变更，仅分配改变时发布不可变新版（见下节）；
 - 起点不早于终点、引用未知组、锁定不可用频点等校验失败均返回 400 并拒绝
   整次操作。
 - **现场实测留存**：现场可提交某场次一次完整实测（指定发布版号、场次内递增
@@ -95,6 +100,8 @@ python tests/integration_check.py
 | POST | `/sessions/{id}/interferences` | 录入干扰关系 |
 | POST | `/sessions/{id}/occupations` | 登记频点占用（返回记录编号） |
 | GET  | `/sessions/{id}/occupations` | 查询场次当前占用 |
+| POST | `/sessions/{id}/occupations/preview` | 现场占用调整预演（只读，返回快照标识/违规组/替代分配） |
+| POST | `/sessions/{id}/occupations/confirm` | 携带快照标识原子确认占用调整（仅改频时发新版） |
 | DELETE | `/sessions/{id}/occupations/{occ_id}` | 撤销一条占用记录 |
 | POST | `/sessions/{id}/plans` | 规划并发布新版本（携带 `base_version` 与 `locks`） |
 | GET  | `/sessions/{id}/plans` | 列出全部发布版 |
@@ -107,9 +114,11 @@ python tests/integration_check.py
 | GET  | `/sessions/{id}/measurements/{batch_no}` | 读取指定批次与固化核对结果 |
 
 状态码约定：`201` 创建/发布成功；`400` 校验失败（起点不早于终点、引用未知
-组、锁定不可用频点、占用频点不属于场次、撤销未知占用记录、实测未知发布版/
-漏组/重复组等）；`404` 资源不存在；`409` 版本或批次冲突；`422` 约束不可
-满足（当前发布版不变）。实测批次同批次同内容重试返回 `200`（幂等）。
+组、锁定不可用频点、占用频点不属于场次、撤销未知占用记录、占用调整的未知/
+重复撤销编号与非法登记、实测未知发布版/漏组/重复组等）；`404` 资源不存在；
+`409` 版本、批次或占用调整快照冲突；`422` 约束不可满足（当前发布版不变）。
+实测批次同批次同内容重试返回 `200`（幂等）；占用调整预演与确认成功均为
+`200`（预演只读、确认可能顺带发布新版）。
 
 ## 请求示例
 
@@ -266,6 +275,120 @@ curl -s -X DELETE http://localhost:8000/sessions/1/occupations/1
 bash examples/occupations.sh
 ```
 
+## 现场占用调整：预演与原子确认
+
+现场在真正调整外部频点占用**之前**，先按场次把一次完整变更——**待撤销的
+占用编号** `revoke` 与**待登记**的频点/左闭右开整数分钟时段 `register`
+——提交到 `POST /sessions/{id}/occupations/preview` 预演（**只读**，不产生
+任何数据变化）：
+
+- 返回**快照标识** `snapshot_token`，覆盖当时的**当前发布版号、可用频点、
+  设备组时段、干扰关系与全部当前占用**（其中任何一项变化都会使确认冲突）；
+- 返回当前发布版在**变更后**违反约束的组 `violating_groups` 及明细
+  `violations`（不可用频点 / 违反的干扰关系 / 与占用冲突的组及相关占用）；
+- 返回**替代分配** `replacement_assignment` 与改频组 `changed_groups`。
+  替代分配必须**保留当前版的锁定**（`retained_locks` 回显），优化目标依次
+  为：相对当前版**改频组数最少** → 按组编号升序的频点序列取**字典序最小**；
+- 变更后没有任何组违规时，无需替代分配（`replacement_assignment` 为
+  `null`、`changed_groups` 为空），确认只改占用、不发布新版；
+- **无当前发布版**时预演返回 `422 no_published_plan`；**当前版组集合与
+  现有组不一致**时返回 `422 group_set_mismatch`；
+- 变更后**无可行分配**时预演返回 `422 unsatisfiable`，说明导致无解的锁定
+  （`cause:"locks"`）、干扰关系（`"interferences"`）或占用
+  （`"occupations"`，待登记占用以 `register_index` 引用），响应中**不含
+  快照令牌**，即**不允许确认**；
+- 未知/重复撤销编号、不可用频点、非左闭右开时段均在**预演前**整次拒绝
+  （`400 invalid_adjustment`，`detail.issues` 一次列全），失败不留部分变更。
+
+随后向 `POST /sessions/{id}/occupations/confirm` 提交**同一变更**与
+`snapshot_token`：
+
+- 预演后**版本、配置（设备组/干扰）或占用有任何变化** → `409
+  snapshot_conflict`；提交变更与预演不一致 → `409 change_mismatch`；令牌
+  损坏或属于其他场次 → `400 invalid_snapshot_token`；
+- 否则在**同一场次行锁的单事务**内原子完成：撤销（删除）→ 登记 →
+  仅当 `changed_groups` 非空时发布**不可变新版本**（锁定随新版留存）。
+  确认是幂等意义上的“一次性”操作：成功后再用同一令牌确认必为
+  `409 snapshot_conflict`；
+- 成功响应 `200` 给出 `version`（未发新版时等于 `base_version`）、
+  `replacement_published`、逐组改频 `changed_groups`、最终 `assignments`
+  与**最终占用** `occupations`，以及本次 `revoked` / `registered` 的记录；
+- 任何失败（校验、冲突、无解、求解超限）都在提交事务内回滚，**绝不留下
+  部分变更**；已发布旧版始终不可变。
+
+预演为只读（`REPEATABLE READ` 快照事务）；确认与发布、占用登记/撤销、
+设备组与干扰录入共用场次行锁串行。既有占用登记/撤销与发布接口保持不变，
+可继续独立使用。
+
+请求体（两个接口相同，确认额外携带 `snapshot_token`）：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `revoke` | 待撤销的当前占用记录编号列表；未知或重复编号整次拒绝（可空） |
+| `register` | 待登记占用列表 `{frequency, start, end}`，左闭右开整数分钟、频点须属于场次（可空） |
+| `snapshot_token` | 仅确认需要：预演返回的快照标识 |
+
+```bash
+# 预演：撤销占用 1，并登记外部设备在 [30,150) 占用频点 4
+curl -s -X POST http://localhost:8000/sessions/1/occupations/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"revoke": [1],
+       "register": [{"frequency": 4, "start": 30, "end": 150}]}'
+# => {
+#      "snapshot_token": "eyJjaGFuZ2Ui...",
+#      "base_version": 1,
+#      "violating_groups": [2],
+#      "violations": {"unavailable": [], "interferences": [],
+#                     "occupations": [{"group_id": 2, "frequency": 4,
+#                       "related_occupations": [
+#                         {"register_index": 0, "frequency": 4,
+#                          "start": 30, "end": 150}]}]},
+#      "replacement_assignment": [
+#        {"group_id": 1, "frequency": 1},
+#        {"group_id": 2, "frequency": 5},
+#        {"group_id": 3, "frequency": 1}],
+#      "changed_groups": [2], "retained_locks": [], "can_confirm": true }
+
+# 携带快照标识与同一变更确认（原子撤销+登记；组 2 改频 4->5，故发布 v2）
+curl -s -X POST http://localhost:8000/sessions/1/occupations/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_token": "eyJjaGFuZ2Ui...",
+       "revoke": [1],
+       "register": [{"frequency": 4, "start": 30, "end": 150}]}'
+# => {"applied": true, "base_version": 1, "version": 2,
+#     "replacement_published": true,
+#     "changed_groups": [{"group_id": 2, "old_frequency": 4,
+#                         "new_frequency": 5}],
+#     "assignments": [...], "revoked": [...], "registered": [...],
+#     "occupations": [...最终全部占用...] }
+```
+
+预演拒绝情形：
+
+| 情形 | 状态码 | `detail.error` |
+| ---- | ------ | -------------- |
+| 场次不存在 | 404 | （`"场次不存在"`） |
+| 未知/重复撤销编号、不可用频点、`start>=end` | 400 | `invalid_adjustment`（`issues` 列全） |
+| 尚无发布版 | 422 | `no_published_plan` |
+| 当前版组集合与现有组不一致 | 422 | `group_set_mismatch` |
+| 变更后无可行分配（锁定/干扰/占用） | 422 | `unsatisfiable`（无快照令牌，不可确认） |
+| 求解超出资源上限 | 503 | （`"求解超出资源限制…"`） |
+
+确认额外情形：
+
+| 情形 | 状态码 | `detail.error` |
+| ---- | ------ | -------------- |
+| 快照令牌损坏 / 属于其他场次 | 400 | `invalid_snapshot_token` |
+| 预演后版本/配置/占用变化，或令牌已被成功使用 | 409 | `snapshot_conflict` |
+| 提交变更与预演不是同一变更 | 409 | `change_mismatch` |
+| 当前版组集合不一致 / 变更后无解（快照虽新但复核失败） | 422 | `group_set_mismatch` / `unsatisfiable` |
+
+也可以直接运行示例脚本（需服务已启动）：
+
+```bash
+bash examples/adjustment.sh
+```
+
 ## 逐组切换路线
 
 现场设备无法把新发布版的频点一次切换到位，需要逐组调频。给定**同一场次**
@@ -383,6 +506,7 @@ curl -s -X POST http://localhost:8000/sessions/1/retune \
 ```bash
 bash examples/demo.sh          # 场次/组/干扰/发布/差异
 bash examples/occupations.sh   # 占用登记、查询、422 与撤销
+bash examples/adjustment.sh    # 现场占用调整：预演 + 快照冲突 + 原子确认
 bash examples/retune.sh        # 逐组切换路线（只读）
 bash examples/measurements.sh  # 现场实测批次留存与核对
 ```
@@ -497,14 +621,17 @@ curl -s http://localhost:8000/sessions/1/measurements/1
 ## 项目结构
 
 ```
-app/main.py    HTTP API 与发布事务（行锁串行化并发发布与占用变更；切换路线
-               只读快照，起点/终点/每个临时步骤都按当前占用检查）
+app/main.py    HTTP API 与发布事务（行锁串行化并发发布与占用变更；现场占用
+               调整预演为只读快照、确认在单事务内原子完成；切换路线只读
+               快照，起点/终点/每个临时步骤都按当前占用检查）
 app/solver.py  回溯 + 前向检查求解器（含占用禁用频点）；无解时给出不可约的
                锁定/干扰/占用核心
+app/adjustment.py 现场占用调整的纯逻辑：变更校验、状态/变更指纹与无状态
+               快照令牌、变更后违规检查与保留锁定的最少改频替代分配
 app/retune.py  逐组切换路线：连通分量分解 + 限深 BFS（最少步数、字典序最小）
 app/measurement.py  实测批次核对（偏离发布版/不可用频点/间距违规/占用冲突）
 app/db.py      连接池、启动重试与 schema 初始化
-schema.sql     表结构（应用启动时幂等执行；occupations/measurements 为本轮新增）
-tests/         求解器与实测核对单元测试、端到端集成检查
+schema.sql     表结构（应用启动时幂等执行；占用/实测/调整复用既有表）
+tests/         求解器、调整、实测核对单元测试与端到端集成检查
 examples/      curl 请求示例
 ```

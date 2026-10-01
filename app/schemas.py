@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SessionCreate(BaseModel):
@@ -64,3 +64,31 @@ class MeasurementCreate(BaseModel):
         ge=1, description="场次内递增批次号；低于已记录最新批次将被拒绝")
     readings: list[MeasurementReading] = Field(
         min_length=1, description="每个设备组的实测整数频点；不得漏组或重复组")
+
+
+class OccupationRegister(BaseModel):
+    frequency: int = Field(
+        description="待登记占用的可用频点（须属于场次可用集合）")
+    start: int = Field(description="占用时段起点（分钟，左闭）")
+    end: int = Field(description="占用时段终点（分钟，右开）")
+
+
+class OccupationAdjustment(BaseModel):
+    """现场占用调整的一次完整变更：撤销既有占用 + 登记新占用。"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    revoke: list[int] = Field(
+        default_factory=list,
+        description="待撤销的当前占用记录编号；未知或重复编号整次拒绝")
+    new_occupations: list[OccupationRegister] = Field(
+        default_factory=list,
+        alias="register",
+        validation_alias="register",
+        serialization_alias="register",
+        description="待登记占用（可用频点 + 左闭右开整数分钟时段）")
+
+
+class OccupationAdjustmentConfirm(OccupationAdjustment):
+    """确认调整：在同一变更之外携带预演返回的快照标识。"""
+    snapshot_token: str = Field(
+        min_length=1, description="预演返回的快照标识；状态变化即冲突")
