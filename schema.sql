@@ -93,3 +93,20 @@ CREATE TABLE IF NOT EXISTS measurement_readings (
 
 CREATE INDEX IF NOT EXISTS idx_measurements_session
     ON measurements (session_id, batch_no);
+
+-- 现场占用调整预演快照：预演时固化“所见状态指纹”（当前发布版、设备组/干扰
+-- 配置、当前占用与可用频点）与同一份变更；确认时重建指纹比对，状态或变更
+-- 有变化即冲突（409），否则在同一场次行锁内原子完成占用变更。
+-- 仅对“存在当前发布版、且组集合与当前一致”的可确认预演写入；无解预演不落表。
+CREATE TABLE IF NOT EXISTS occupation_adjustment_snapshots (
+    id           SERIAL PRIMARY KEY,
+    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    base_version INTEGER NOT NULL,        -- 预演所见当前发布版号
+    change       JSONB NOT NULL,          -- 本次变更（revoke 编号升序、register 规范化）
+    state_fingerprint JSONB NOT NULL,     -- 所见状态指纹（版本/配置/占用/可用频点）
+    preview      JSONB NOT NULL,          -- 预演结果（违规组与替代分配），确认响应复用
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_occ_adj_snapshots_session
+    ON occupation_adjustment_snapshots (session_id, id);

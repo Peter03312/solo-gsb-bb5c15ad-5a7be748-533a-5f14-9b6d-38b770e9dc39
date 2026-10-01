@@ -736,6 +736,215 @@ def main() -> int:
         check("并发后批次无矛盾记录",
               [x["batch_no"] for x in r.json()] == [1, 2, 5, 6, 7, 8], r.text)
 
+        # ---------------------------------------------------------------- #
+        # 现场占用调整：预演 + 快照确认（原子变更；仅分配改变时发新版）
+        # ---------------------------------------------------------------- #
+        r = c.post("/sessions", json={"name": "占用调整演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6]})
+        aid = r.json()["id"]
+        check("创建占用调整场次", r.status_code == 201, r.text)
+        ag = []
+        for name, s, e in [("a", 0, 120), ("b", 60, 180), ("c", 120, 240)]:
+            r = c.post(f"/sessions/{aid}/groups",
+                       json={"name": name, "start": s, "end": e})
+            ag.append(r.json()["id"])
+        aa, ab, ac = ag
+        c.post(f"/sessions/{aid}/interferences",
+               json={"group_a": aa, "group_b": ab, "min_separation": 3})
+        c.post(f"/sessions/{aid}/interferences",
+               json={"group_a": ab, "group_b": ac, "min_separation": 3})
+        r = c.post(f"/sessions/{aid}/plans",
+                   json={"base_version": 0, "locks": []})
+        check("调整场次 v1 发布 (a=1,b=4,c=1)", r.status_code == 201
+              and {x["group_id"]: x["frequency"]
+                   for x in r.json()["assignments"]}
+              == {aa: 1, ab: 4, ac: 1}, r.text)
+
+        def adj_preview(body):
+            return c.post(
+                f"/sessions/{aid}/occupations/adjustment/preview", json=body)
+
+        def adj_confirm(body):
+            return c.post(
+                f"/sessions/{aid}/occupations/adjustment/confirm", json=body)
+
+        # 无发布版场次 -> 409 no_current_plan
+        r = c.post("/sessions", json={"name": "调整无版",
+                                      "frequencies": [1]})
+        nid = r.json()["id"]
+        c.post(f"/sessions/{nid}/groups", json={"start": 0, "end": 60})
+        r = c.post(f"/sessions/{nid}/occupations/adjustment/preview",
+                   json={"register": [{"frequency": 1, "start": 0, "end": 5}]})
+        check("无发布版拒绝预演(409)", r.status_code == 409
+              and r.json()["detail"]["error"] == "no_current_plan", r.text)
+
+        # 整次校验：未知/重复撤销编号、不可用频点、无效时段一并拒绝
+        r = adj_preview({"revoke": [999998, 999999, 999998],
+                         "register": [{"frequency": 77, "start": 8, "end": 8},
+                                      {"frequency": 1, "start": 0, "end": 5}]})
+        check("预演非法变更整次拒绝(400)", r.status_code == 400, r.text)
+        d = r.json()["detail"]
+        check("非法变更列明全部问题",
+              d["error"] == "invalid_adjustment"
+              and d["unknown_revoke"] == [999998, 999999]
+              and d["duplicate_revoke"] == [999998]
+              and d["invalid_intervals"] == [0]
+              and d["unavailable_frequencies"]
+              == [{"index": 0, "frequency": 77}], str(d))
+        check("非法预演不留占用",
+              c.get(f"/sessions/{aid}/occupations").json() == [])
+
+        # 预演：登记频点4 [30,150)（与三组都相交）-> 组2违规，替代改频1
+        r = adj_preview({"revoke": [],
+                         "register": [{"frequency": 4, "start": 30, "end": 150}]})
+        check("预演登记频点4 200", r.status_code == 200, r.text)
+        pv = r.json()
+        snap1 = pv["snapshot_id"]
+        check("预演返回快照标识与版号",
+              isinstance(snap1, int) and pv["base_version"] == 1)
+        check("预演违规组为 b", pv["violating_groups"] == [ab], str(pv))
+        check("预演占用冲突定位到 b=4",
+              pv["violations"]["occupations"]
+              == [{"group_id": ab, "frequency": 4}], str(pv["violations"]))
+        check("相关占用引用待登记项",
+              pv["violations"]["related_occupations"]
+              == [{"id": None, "index": 0, "frequency": 4,
+                   "start": 30, "end": 150}], str(pv["violations"]))
+        repl = {x["group_id"]: x["frequency"]
+                for x in pv["replacement"]["assignments"]}
+        check("替代分配最小改频且字典序最小",
+              repl == {aa: 1, ab: 5, ac: 1}
+              and pv["replacement"]["changes"] == 1, str(repl))
+        check("预演为只读，占用未变",
+              c.get(f"/sessions/{aid}/occupations").json() == [])
+
+        # 携带不同变更确认 -> 409，无副作用
+        r = adj_confirm({"snapshot_id": snap1, "revoke": [],
+                         "register": [{"frequency": 4, "start": 30, "end": 160}]})
+        check("确认变更不一致 409", r.status_code == 409
+              and r.json()["detail"]["error"] == "snapshot_change_mismatch",
+              r.text)
+
+        # 正确确认：原子登记 + 发布不可变新版 v2
+        r = adj_confirm({"snapshot_id": snap1, "revoke": [],
+                         "register": [{"frequency": 4, "start": 30, "end": 150}]})
+        check("确认调整 200", r.status_code == 200, r.text)
+        cf = r.json()
+        occ4 = cf["registered"][0]["id"]
+        check("确认发布 v2 并返回最终占用/版号",
+              cf["version"] == 2 and cf["republished"] is True
+              and cf["base_version"] == 1
+              and len(cf["occupations"]) == 1
+              and cf["occupations"][0]["id"] == occ4, str(cf))
+        r = c.get(f"/sessions/{aid}/plans/2")
+        check("v2 为不可变新发布版", r.status_code == 200
+              and {x["group_id"]: x["frequency"]
+                   for x in r.json()["assignments"]}
+              == {aa: 1, ab: 5, ac: 1}, r.text)
+        r = c.get(f"/sessions/{aid}/plans")
+        check("调整后版本列表 [1,2]", [p["version"] for p in r.json()]
+              == [1, 2], r.text)
+
+        # 空变更预演 + 确认：当前 v2 在占用下可行 -> 不发新版
+        r = adj_preview({"revoke": [], "register": []})
+        check("空变更预演 200", r.status_code == 200
+              and r.json()["violating_groups"] == []
+              and r.json()["replacement"]["changes"] == 0, r.text)
+        snap0 = r.json()["snapshot_id"]
+        r = adj_confirm({"snapshot_id": snap0, "revoke": [], "register": []})
+        check("空变更确认不发新版、版号仍2",
+              r.status_code == 200 and r.json()["version"] == 2
+              and r.json()["republished"] is False, r.text)
+
+        # 快照状态冲突：预演撤销，再经遗留接口登记其他占用，确认 -> 409
+        r = adj_preview({"revoke": [occ4], "register": []})
+        snap_rev = r.json()["snapshot_id"]
+        check("撤销预演 200 且无违规", r.status_code == 200
+              and r.json()["violating_groups"] == []
+              and r.json()["occupations_after"] == [], r.text)
+        c.post(f"/sessions/{aid}/occupations",
+               json={"frequency": 6, "start": 0, "end": 10})
+        r = adj_confirm({"snapshot_id": snap_rev,
+                         "revoke": [occ4], "register": []})
+        check("状态变化后确认 409", r.status_code == 409
+              and r.json()["detail"]["error"] == "snapshot_conflict", r.text)
+        r = c.get(f"/sessions/{aid}/occupations")
+        check("冲突不留部分变更（两条占用都在）",
+              {o["frequency"] for o in r.json()} == {4, 6}, r.text)
+        check("冲突不发新版",
+              [p["version"] for p in c.get(
+                  f"/sessions/{aid}/plans").json()] == [1, 2])
+
+        # 未知快照标识 -> 400
+        r = adj_confirm({"snapshot_id": 999999, "revoke": [], "register": []})
+        check("未知快照标识 400", r.status_code == 400
+              and r.json()["detail"]["error"] == "invalid_reference", r.text)
+
+        # 撤销占用使当前版恢复可行：仅删除占用、不发新版（版号仍2）
+        r = adj_preview({"revoke": [], "register": []})
+        # 当前两条占用：4[30,150)、6[0,10)；v2 为 (1,5,1)，均不冲突
+        snap_ok = r.json()["snapshot_id"]
+        check("遗留占用登记后 v2 仍可行", r.status_code == 200
+              and r.json()["violating_groups"] == [], r.text)
+        occ6 = next(o["id"] for o in c.get(
+            f"/sessions/{aid}/occupations").json()
+            if o["frequency"] == 6)
+        r = adj_preview({"revoke": [occ4, occ6], "register": []})
+        snap_both = r.json()["snapshot_id"]
+        check("撤销两条预演：无违规、占用列表清空",
+              r.status_code == 200
+              and r.json()["violating_groups"] == []
+              and r.json()["occupations_after"] == [], r.text)
+        r = adj_confirm({"snapshot_id": snap_both,
+                         "revoke": [occ6, occ4], "register": []})
+        check("撤销确认成功（撤销顺序无关的同一变更）",
+              r.status_code == 200 and r.json()["version"] == 2
+              and r.json()["republished"] is False
+              and r.json()["revoked"] == sorted([occ4, occ6]), r.text)
+
+        # 一次变更同时撤销与登记；占用只撞锁定组 -> 422，说明锁定/占用
+        # 单组场次：可用 1..2，组锁定频点 1
+        r = c.post("/sessions", json={"name": "调整无解",
+                                      "frequencies": [1, 2]})
+        uid = r.json()["id"]
+        ug = c.post(f"/sessions/{uid}/groups",
+                    json={"start": 0, "end": 60}).json()["id"]
+        c.post(f"/sessions/{uid}/plans",
+               json={"base_version": 0,
+                     "locks": [{"group_id": ug, "frequency": 1}]})
+        r = c.post(f"/sessions/{uid}/occupations/adjustment/preview",
+                   json={"register": [
+                       {"frequency": 1, "start": 0, "end": 60},
+                       {"frequency": 2, "start": 0, "end": 60}]})
+        check("占用调整无解 422", r.status_code == 422, r.text)
+        d = r.json()["detail"]
+        check("422 说明锁定与占用且不允许确认",
+              d["error"] == "unsatisfiable"
+              and d["cause"] == "occupations"
+              and d["locks"] == [{"group_id": ug, "frequency": 1}]
+              and [o.get("index") for o in d["occupations"]] == [0, 1]
+              and "snapshot_id" not in d, str(d))
+        check("无解不留占用",
+              c.get(f"/sessions/{uid}/occupations").json() == [])
+        check("无解不发新版",
+              [p["version"]
+               for p in c.get(f"/sessions/{uid}/plans").json()] == [1])
+
+        # 当前版组集合与现有组不一致 -> 422
+        c.post(f"/sessions/{aid}/groups",
+               json={"name": "d", "start": 0, "end": 240})
+        r = adj_preview({"register": []})
+        check("组集合不一致拒绝预演(422)", r.status_code == 422
+              and r.json()["detail"]["error"] == "group_set_mismatch",
+              r.text)
+
+        # 既有占用接口仍完全兼容（启动可用、登记/撤销行为不变）
+        r = c.post(f"/sessions/{aid}/occupations",
+                   json={"frequency": 3, "start": 0, "end": 10})
+        check("遗留占用登记接口兼容", r.status_code == 201, r.text)
+        r = c.delete(f"/sessions/{aid}/occupations/{r.json()['id']}")
+        check("遗留占用撤销接口兼容", r.status_code == 200, r.text)
+
         print()
         if _failures:
             print(f"{len(_failures)} 项失败: {_failures}")

@@ -51,6 +51,28 @@ class OccupationCreate(BaseModel):
     end: int = Field(description="占用时段终点（分钟，右开）")
 
 
+class OccupationRegister(BaseModel):
+    frequency: int = Field(
+        description="待登记占用的可用频点（须属于场次可用集合）")
+    start: int = Field(description="占用时段起点（分钟，左闭）")
+    end: int = Field(description="占用时段终点（分钟，右开）")
+
+
+class OccupationAdjustment(BaseModel):
+    # JSON 键固定为 "register"；属性名避开 BaseModel 自身的 register 方法。
+    revoke: list[int] = Field(
+        default_factory=list,
+        description="待撤销的占用记录编号；未知或重复编号整次拒绝")
+    register_items: list[OccupationRegister] = Field(
+        default_factory=list, alias="register",
+        description="待登记的占用（可用频点 + 左闭右开整数分钟时段）")
+
+
+class OccupationAdjustmentConfirm(OccupationAdjustment):
+    snapshot_id: int = Field(
+        ge=1, description="预演返回的快照标识；确认须携带同一快照与同一变更")
+
+
 class MeasurementReading(BaseModel):
     group_id: int = Field(description="设备组编号；组集合须与发布版及当前一致")
     frequency: int = Field(

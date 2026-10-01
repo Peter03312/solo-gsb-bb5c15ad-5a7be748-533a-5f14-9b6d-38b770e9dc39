@@ -8,8 +8,13 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 from psycopg2.extras import Json
 
 from . import db
+from .adjustment import (AdjustmentValidationError, apply_change,
+                         assignment_list, occ_ref, solve_replacement,
+                         unsat_explanation, validate_change,
+                         violation_detail)
 from .measurement import analyze_measurement
 from .schemas import (GroupCreate, InterferenceCreate, MeasurementCreate,
+                      OccupationAdjustment, OccupationAdjustmentConfirm,
                       OccupationCreate, PlanCreate, RetuneRequest,
                       SessionCreate)
 from .solver import (FrequencySolver, SolverLimitExceeded, analyze_unsat,
@@ -27,10 +32,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="频点协调服务",
-    version="1.2.0",
+    version="1.3.0",
     description="为临时演出的无线电设备组协调频点：录入场次、设备组时段与"
                 "干扰关系，登记/撤销外部设备频点占用，按约束规划并发布不可"
-                "变的频点分配版本，并可留存现场实测频点批次、固化核对差异。",
+                "变的频点分配版本，可留存现场实测频点批次、固化核对差异；并"
+                "支持现场占用调整的预演（快照）与原子确认。",
     lifespan=lifespan,
 )
 
@@ -227,6 +233,332 @@ def list_occupations(session_id: int, conn=Depends(db.get_conn)):
     return [{"id": occ["id"], "frequency": occ["frequency"],
              "start": occ["start"], "end": occ["end"],
              "created_at": occ["created_at"]} for occ in occupations]
+
+
+# --------------------------------------------------------------------- #
+# 现场占用调整：预演 + 快照确认（原子完成占用变更，必要时发布不可变新版）
+# --------------------------------------------------------------------- #
+def _adjustment_error(status_code: int, code: str, message: str, **extra):
+    detail = {"error": code, "message": message, **extra}
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def _active_edges(groups, interferences):
+    """按时段相交（左闭右开）过滤后生效的干扰关系 [(a, b, sep)]。"""
+    group_by_id = {g["id"]: g for g in groups}
+    edges = []
+    for itf in interferences:
+        ga, gb = group_by_id[itf["group_a"]], group_by_id[itf["group_b"]]
+        if intervals_overlap(ga["start"], ga["end"], gb["start"], gb["end"]):
+            edges.append((itf["group_a"], itf["group_b"],
+                          itf["min_separation"]))
+    return edges
+
+
+def _load_plan_locks(conn, plan_id: int) -> dict[int, int]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT group_id, frequency FROM plan_locks "
+                    "WHERE plan_id = %s", (plan_id,))
+        return {r[0]: r[1] for r in cur.fetchall()}
+
+
+def _canonical_change(revoke_ids, additions) -> dict:
+    """把变更规范化为与顺序无关的形态（指纹与一致性比对均以此为准）。"""
+    return {
+        "revoke": sorted(revoke_ids),
+        "register": sorted(
+            ({"frequency": it.frequency, "start": it.start, "end": it.end}
+             for it in additions),
+            key=lambda x: (x["frequency"], x["start"], x["end"])),
+    }
+
+
+def _state_fingerprint(session, version, groups, interferences, occupations):
+    """当前发布版、设备组/干扰配置与当前占用（含可用频点）的所见状态指纹。"""
+    return {
+        "version": version,
+        "frequencies": list(session["frequencies"]),
+        "groups": [{"id": g["id"], "start": g["start"], "end": g["end"]}
+                   for g in sorted(groups, key=lambda g: g["id"])],
+        "interferences": sorted(
+            ({"group_a": itf["group_a"], "group_b": itf["group_b"],
+              "min_separation": itf["min_separation"]}
+             for itf in interferences),
+            key=lambda e: (e["group_a"], e["group_b"], e["min_separation"])),
+        "occupations": [{"id": o["id"], "frequency": o["frequency"],
+                         "start": o["start"], "end": o["end"]}
+                        for o in sorted(occupations, key=lambda o: o["id"])],
+    }
+
+
+def _adjustment_payload(payload):
+    """抽取一次调整的撤销编号列表与待登记项（含提交序号 0..n-1）。"""
+    revoke = list(payload.revoke)
+    additions = [{"frequency": item.frequency, "start": item.start,
+                  "end": item.end, "index": i}
+                 for i, item in enumerate(payload.register_items)]
+    return revoke, additions
+
+
+def _preview_document(session_id, base_version, payload, change,
+                      violations, assignment, changes, occupations_after):
+    """组装预演（及确认复用）的结果文档（不含快照标识等传输级字段）。"""
+    return {
+        "base_version": base_version,
+        "change": {
+            "revoke": change["revoke"],
+            "register": [
+                {"index": i, "frequency": item.frequency,
+                 "start": item.start, "end": item.end}
+                for i, item in enumerate(payload.register_items)],
+        },
+        "violations": {
+            "unavailable": violations["unavailable"],
+            "interferences": violations["interferences"],
+            "occupations": violations["occupations"],
+            "related_occupations": violations["related_occupations"],
+        },
+        "violating_groups": violations["violating_groups"],
+        "replacement": {
+            "changes": changes,
+            "assignments": assignment_list(assignment),
+        },
+        "occupations_after": [occ_ref(o) for o in occupations_after],
+        "session_id": session_id,
+    }
+
+
+@app.post("/sessions/{session_id}/occupations/adjustment/preview")
+def preview_occupation_adjustment(session_id: int,
+                                  payload: OccupationAdjustment,
+                                  conn=Depends(db.get_conn)):
+    """现场占用调整预演（只读计算，不改动任何占用或发布版）。
+
+    按场次以待撤销占用编号与待登记（频点 + 左闭右开整数分钟时段）预演：
+    返回覆盖当前发布版、设备组/干扰配置与占用的快照标识，给出当前版在变更
+    后违反约束的组，以及保留当前版锁定、相对当前版改频组数最少（并列按组号
+    升序频点序列字典序最小）的替代分配。
+
+    未知/重复撤销编号、不可用频点、无效时段整次拒绝（400，不留任何变更）；
+    无当前发布版或当前版组集合与现有组不一致时拒绝（409/422）；无可行替代
+    分配时返回 422 说明相关锁定、干扰或占用，且不发放可确认的快照标识。
+    """
+    # 锁场次行：与发布、占用登记/撤销及确认互斥，保证预演所见状态一致
+    session = _load_session(conn, session_id, for_update=True)
+    groups = _load_groups(conn, session_id)
+    interferences = _load_interferences(conn, session_id)
+    occupations = _load_occupations(conn, session_id)
+    current = _current_version(conn, session_id)
+    if current == 0:
+        raise _adjustment_error(
+            409, "no_current_plan",
+            "该场次尚无发布版，无法以其为当前版预演占用调整；请先规划发布")
+
+    revoke, additions = _adjustment_payload(payload)
+    try:
+        validate_change(session["frequencies"], occupations,
+                        revoke, additions)
+    except AdjustmentValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.detail)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM plans WHERE session_id = %s AND version = %s",
+                    (session_id, current))
+        current_plan_id = cur.fetchone()[0]
+    current_assignment = _load_assignments(conn, current_plan_id)
+    current_locks = _load_plan_locks(conn, current_plan_id)
+
+    current_groups = {g["id"] for g in groups}
+    if set(current_assignment) != current_groups:
+        raise _adjustment_error(
+            422, "group_set_mismatch",
+            "当前发布版的组集合与场次现有组不一致，拒绝预演；请先重新规划发布",
+            only_in_plan=sorted(set(current_assignment) - current_groups),
+            only_in_current=sorted(current_groups - set(current_assignment)))
+
+    kept, pending = apply_change(occupations, revoke, additions)
+    occupations_after = kept + pending
+    edges = _active_edges(groups, interferences)
+    detail = violation_detail(groups, current_assignment, edges,
+                              session["frequencies"], occupations_after)
+
+    try:
+        solved = solve_replacement(
+            groups, session["frequencies"], edges, current_assignment,
+            current_locks, occupations_after)
+    except SolverLimitExceeded:
+        raise HTTPException(status_code=503,
+                            detail="求解超出资源限制，请缩小规模后重试")
+    if solved is None:
+        analysis = unsat_explanation(
+            groups, session["frequencies"], edges, current_assignment,
+            current_locks, occupations_after)
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "unsatisfiable",
+                    "message": "变更后不存在保留当前版锁定的可行分配，"
+                               "不允许确认",
+                    "violations": {
+                        "unavailable": detail["unavailable"],
+                        "interferences": detail["interferences"],
+                        "occupations": detail["occupations"],
+                        "related_occupations": detail["related_occupations"]},
+                    "violating_groups": detail["violating_groups"],
+                    **analysis})
+
+    assignment, changes = solved
+    change = _canonical_change(revoke, payload.register_items)
+    fingerprint = _state_fingerprint(
+        session, current, groups, interferences, occupations)
+    preview_doc = _preview_document(
+        session_id, current, payload, change, detail,
+        assignment, changes, occupations_after)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO occupation_adjustment_snapshots "
+            "(session_id, base_version, change, state_fingerprint, preview) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (session_id, current, Json(change), Json(fingerprint),
+             Json(preview_doc)))
+        snapshot_id = cur.fetchone()[0]
+    conn.commit()  # 预演不改动占用/发布版，仅留存快照
+
+    return {**preview_doc, "snapshot_id": snapshot_id,
+            "confirmable": True}
+
+
+@app.post("/sessions/{session_id}/occupations/adjustment/confirm")
+def confirm_occupation_adjustment(session_id: int,
+                                  payload: OccupationAdjustmentConfirm,
+                                  conn=Depends(db.get_conn)):
+    """凭预演快照标识确认同一占用变更（原子提交；必要时发布不可变新版）。
+
+    在同一场次行锁内重建状态指纹：版本、配置或占用相对预演时有变化即 409
+    冲突；携带变更与快照所预演的变更不同亦 409。全部一致时原子完成撤销与
+    登记；仅当替代分配与当前版不同时发布不可变新版本（锁定沿用当前版），
+    分配不变则不产生新版，最终占用与版号随响应返回。失败不留部分变更。
+    """
+    session = _load_session(conn, session_id, for_update=True)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, base_version, change, state_fingerprint, preview "
+            "FROM occupation_adjustment_snapshots "
+            "WHERE id = %s AND session_id = %s",
+            (payload.snapshot_id, session_id))
+        row = cur.fetchone()
+    if row is None:
+        raise _adjustment_error(
+            400, "invalid_reference",
+            f"快照标识 {payload.snapshot_id} 不存在或不属于本场次",
+            field="snapshot_id", snapshot_id=payload.snapshot_id)
+    snapshot_id, base_version, saved_change, saved_fingerprint, preview = row
+
+    groups = _load_groups(conn, session_id)
+    interferences = _load_interferences(conn, session_id)
+    occupations = _load_occupations(conn, session_id)
+    current = _current_version(conn, session_id)
+    fingerprint = _state_fingerprint(
+        session, current, groups, interferences, occupations)
+    if fingerprint != saved_fingerprint:
+        raise _adjustment_error(
+            409, "snapshot_conflict",
+            "快照所依据的版本、配置或占用已变化，请重新预演后再确认",
+            snapshot_id=snapshot_id,
+            snapshot_version=base_version, current_version=current)
+
+    revoke, additions = _adjustment_payload(payload)
+    submitted_change = _canonical_change(revoke, payload.register_items)
+    if submitted_change != saved_change:
+        raise _adjustment_error(
+            409, "snapshot_change_mismatch",
+            "确认携带的变更与快照预演的变更不一致，请重新预演后再确认",
+            snapshot_id=snapshot_id, submitted=submitted_change,
+            expected=saved_change)
+
+    # 再次整次校验：占用编号在指纹比对后理论上仍存在（指纹含全部占用），
+    # 该校验保证任何情况下都不会产生部分变更。
+    try:
+        validate_change(session["frequencies"], occupations,
+                        revoke, additions)
+    except AdjustmentValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.detail)
+
+    # 以预演固化的替代分配与当前版比对：不同才发布不可变新版；新发布版
+    # 的锁定沿用当前版锁定。
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM plans WHERE session_id = %s AND version = %s",
+                    (session_id, current))
+        current_plan_id = cur.fetchone()[0]
+    current_assignment = _load_assignments(conn, current_plan_id)
+    new_locks = _load_plan_locks(conn, current_plan_id)
+    replacement = {item["group_id"]: item["frequency"]
+                   for item in preview["replacement"]["assignments"]}
+    republish = replacement != current_assignment
+
+    # ---- 原子变更：撤销 + 登记（与可能的新发布版同一事务提交） ---- #
+    with conn.cursor() as cur:
+        if revoke:
+            cur.execute(
+                "DELETE FROM occupations WHERE session_id = %s AND id = ANY(%s)"
+                " RETURNING id", (session_id, list(set(revoke))))
+            if len(cur.fetchall()) != len(set(revoke)):
+                # 正常不会到达（指纹与校验已覆盖）；到达则整笔回滚
+                raise _adjustment_error(400, "invalid_adjustment",
+                                        "待撤销占用编号与快照不一致")
+        registered = []
+        for item in additions:
+            cur.execute(
+                "INSERT INTO occupations (session_id, frequency, start_min, "
+                "end_min) VALUES (%s, %s, %s, %s) "
+                "RETURNING id, created_at",
+                (session_id, item["frequency"], item["start"], item["end"]))
+            registered.append(cur.fetchone())
+
+        new_version = current
+        new_plan_id = current_plan_id
+        if republish:
+            new_version = current + 1
+            cur.execute(
+                "INSERT INTO plans (session_id, version, changes) "
+                "VALUES (%s, %s, %s) RETURNING id, created_at",
+                (session_id, new_version,
+                 preview["replacement"]["changes"]))
+            new_plan_id, created_at = cur.fetchone()
+            cur.executemany(
+                "INSERT INTO plan_assignments (plan_id, group_id, frequency) "
+                "VALUES (%s, %s, %s)",
+                [(new_plan_id, gid, freq)
+                 for gid, freq in replacement.items()])
+            if new_locks:
+                cur.executemany(
+                    "INSERT INTO plan_locks (plan_id, group_id, frequency) "
+                    "VALUES (%s, %s, %s)",
+                    [(new_plan_id, gid, freq)
+                     for gid, freq in sorted(new_locks.items())])
+    conn.commit()
+
+    final_occupations = _load_occupations(conn, session_id)
+    return {
+        "session_id": session_id,
+        "snapshot_id": snapshot_id,
+        "base_version": base_version,
+        "version": new_version,
+        "republished": republish,
+        "changes": preview["replacement"]["changes"],
+        "assignments": assignment_list(replacement),
+        "violating_groups": preview["violating_groups"],
+        "revoked": sorted(set(revoke)),
+        "registered": [
+            {"index": i, "id": rid, "frequency": item["frequency"],
+             "start": item["start"], "end": item["end"]}
+            for i, ((rid, _created), item) in enumerate(
+                zip(registered, additions))],
+        "occupations": [
+            {"id": o["id"], "frequency": o["frequency"],
+             "start": o["start"], "end": o["end"],
+             "created_at": o["created_at"]} for o in final_occupations],
+    }
 
 
 # --------------------------------------------------------------------- #
